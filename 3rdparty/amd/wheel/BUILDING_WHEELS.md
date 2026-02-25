@@ -26,10 +26,6 @@ ROCm 7.2.0:
 pip install "amd-sglang[all-hip,rocm720]" -i https://pypi.amd.com/rocm-7.2.0/simple --extra-index-url https://pypi.org/simple
 ```
 
-## Resolving Triton
-
-Triton 3.5.1 has a known issue in the ROCm 7.2.0 environment.  Replace the installation following the [ROCm docker recipe](https://github.com/sgl-project/sglang/blob/main/docker/rocm.Dockerfile#L472).
-
 ## Resolving AITER
 
 [AITER](https://github.com/ROCm/aiter) is a fundamental dependency. Wheel-izing it is ongoing.
