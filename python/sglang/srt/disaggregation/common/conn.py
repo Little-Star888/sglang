@@ -125,9 +125,7 @@ class CommonKVManager(BaseKVManager):
 
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
             # TODO(shangming): Fix me when we support MHA/GQA + CP, or when we utilize all cp ranks for KV transfer in CP mode.
-            self.is_dummy_cp_rank = (
-                is_mla_backend and self.attn_cp_size > 1 and self.attn_cp_rank != 0
-            )
+            self.is_dummy_cp_rank = False
             if not self.is_dummy_cp_rank:
                 self.register_to_bootstrap()
             self.transfer_infos = {}
