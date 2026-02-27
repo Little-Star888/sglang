@@ -232,7 +232,7 @@ class CommonKVManager(BaseKVManager):
     ) -> Optional[PrefillServerInfo]:
         """Fetch the prefill server info from the bootstrap server."""
         try:
-            url = f"http://{bootstrap_addr}/route?engine_rank={-1}&prefill_dp_rank={-1}&prefill_cp_rank={-1}&target_pp_rank={-1}"
+            url = f"http://{bootstrap_addr}/route?prefill_dp_rank={-1}&prefill_cp_rank={-1}&target_tp_rank={-1}&target_pp_rank={-1}"
             response = requests.get(url, timeout=5)
             if response.status_code == 200:
                 data = response.json()
@@ -499,14 +499,19 @@ class CommonKVReceiver(BaseKVReceiver):
         if self.kv_mgr.attn_cp_size == self.prefill_info.attn_cp_size:
             self.target_cp_ranks = [self.kv_mgr.attn_cp_rank]
         else:
-            # TODO(shangming): Support KVCache transfer for multiple prefill cp ranks -> 1 decode cp rank
-            # For now, we handle the control plane in advance, but we need to support the data plane in the future.
             self.target_cp_ranks = [
                 rank for rank in range(self.prefill_info.attn_cp_size)
             ]
-            self.required_prefill_response_num *= (
-                self.prefill_info.attn_cp_size // self.kv_mgr.attn_cp_size
-            )
+            # TODO(shangming): Support KVCache transfer for multiple prefill cp ranks -> 1 decode cp rank
+            # For now, we handle the control plane in advance, but we need to support the data plane in the future.
+            if self.kv_mgr.is_mla_backend:
+                # For MLA: we only need to retrieve KVCache from the first CP rank now
+                self.target_cp_ranks = self.target_cp_ranks[:1]
+                self.required_prefill_response_num *= 1
+            else:
+                self.required_prefill_response_num *= (
+                    self.prefill_info.attn_cp_size // self.kv_mgr.attn_cp_size
+                )
 
         # Decode pp size should be equal to prefill pp size or 1
         assert (
@@ -533,6 +538,7 @@ class CommonKVReceiver(BaseKVReceiver):
         self._setup_bootstrap_infos()
 
     def _setup_bootstrap_infos(self):
+        all_bootstrap_infos = []
         # NOTE: key distinguished by bootstrap_addr, prefill_dp_rank, prefill_cp_rank, and target_tp_rank
         for target_cp_rank in self.target_cp_ranks:
             bootstrap_key = f"{self.bootstrap_addr}_{self.prefill_dp_rank}_{target_cp_rank}_{self.target_tp_rank}"
@@ -543,9 +549,9 @@ class CommonKVReceiver(BaseKVReceiver):
                     # Enable higher PP ranks to be bootstrapped earlier to make PP PD requests bootstrap more robust
                     for target_pp_rank in reversed(self.target_pp_ranks):
                         bootstrap_info = self._get_bootstrap_info_from_server(
-                            target_tp_rank,
                             self.prefill_dp_rank,
                             target_cp_rank,
+                            target_tp_rank,
                             target_pp_rank,
                         )
                         if bootstrap_info is not None:
@@ -565,7 +571,7 @@ class CommonKVReceiver(BaseKVReceiver):
                         else:
                             self.kv_mgr.record_failure(
                                 self.bootstrap_room,
-                                f"Could not fetch bootstrap info for engine rank: {self.kv_mgr.kv_args.engine_rank} and prefill_dp_rank: {self.prefill_dp_rank} prefill_cp_rank: {target_cp_rank} and target_pp_rank {target_pp_rank}",
+                                f"Could not fetch bootstrap info for: prefill_dp_rank: {self.prefill_dp_rank} prefill_cp_rank: {target_cp_rank} target_tp_rank: {target_tp_rank} and target_pp_rank {target_pp_rank}",
                             )
                             self.kv_mgr.update_status(
                                 self.bootstrap_room, KVPoll.Failed
@@ -581,13 +587,16 @@ class CommonKVReceiver(BaseKVReceiver):
                 self.bootstrap_infos = self.kv_mgr.connection_pool[bootstrap_key]
 
             assert len(self.bootstrap_infos) > 0
+            all_bootstrap_infos.extend(self.bootstrap_infos)
+
+        self.bootstrap_infos = all_bootstrap_infos
 
     def _get_bootstrap_info_from_server(
-        self, engine_rank, prefill_dp_rank, prefill_cp_rank, target_pp_rank
+        self, prefill_dp_rank, prefill_cp_rank, target_tp_rank, target_pp_rank
     ):
         """Fetch the bootstrap info from the bootstrap server."""
         try:
-            url = f"http://{self.bootstrap_addr}/route?engine_rank={engine_rank}&prefill_dp_rank={prefill_dp_rank}&prefill_cp_rank={prefill_cp_rank}&target_pp_rank={target_pp_rank}"
+            url = f"http://{self.bootstrap_addr}/route?prefill_dp_rank={prefill_dp_rank}&prefill_cp_rank={prefill_cp_rank}&target_tp_rank={target_tp_rank}&target_pp_rank={target_pp_rank}"
             response = requests.get(url, timeout=5)
             if response.status_code == 200:
                 bootstrap_info = response.json()
@@ -780,22 +789,22 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
         return web.Response(text="OK", status=200)
 
     async def _handle_route_get(self, request: web.Request):
-        engine_rank = request.query.get("engine_rank")
         prefill_dp_rank = request.query.get("prefill_dp_rank")
         prefill_cp_rank = request.query.get("prefill_cp_rank")
+        target_tp_rank = request.query.get("target_tp_rank")
         target_pp_rank = request.query.get("target_pp_rank")
         if (
-            not engine_rank
-            or not prefill_dp_rank
+            not prefill_dp_rank
             or not prefill_cp_rank
+            or not target_tp_rank
             or not target_pp_rank
         ):
             return web.Response(text="Missing inputs for bootstrap server.", status=400)
 
         if (
-            int(engine_rank) == -1
-            and int(prefill_dp_rank) == -1
+            int(prefill_dp_rank) == -1
             and int(prefill_cp_rank) == -1
+            and int(target_tp_rank) == -1
             and int(target_pp_rank) == -1
         ):
             if not self._is_ready():
@@ -831,11 +840,11 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
             async with self.lock:
                 bootstrap_info = self.prefill_port_table[int(prefill_dp_rank)][
                     int(prefill_cp_rank)
-                ][int(engine_rank)][int(target_pp_rank)]
+                ][int(target_tp_rank)][int(target_pp_rank)]
         except KeyError:
             return web.Response(
-                text=f"Bootstrap info not found for dp_rank={prefill_dp_rank} "
-                f"engine_rank={engine_rank} pp_rank={target_pp_rank}",
+                text=f"Bootstrap info not found for dp_rank={prefill_dp_rank} cp_rank={prefill_cp_rank} "
+                f"tp_rank={target_tp_rank} pp_rank={target_pp_rank}",
                 status=404,
             )
 
